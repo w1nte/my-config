@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# post-checkout hook: sets up new git worktrees from .worktreelink and
+# .worktreeinclude.
+#
+# Runs after `git worktree add`, whichever tool calls it (the git CLI, Zed,
+# other editors or agents), and prepares the new worktree from the main
+# checkout:
+#
+#   .worktreelink     matching paths are SYMLINKED. A matching directory
+#                     becomes a single link; its contents are not walked.
+#   .worktreeinclude  matching paths are COPIED. Directories are copied
+#                     recursively.
+#
+# Both files use .gitignore syntax and are read from the main worktree. Only
+# untracked paths are considered, nothing that already exists is overwritten,
+# and links are made first, so a path listed in both files ends up linked.
+# Ordinary checkouts, clones and bare repositories are left alone, and the
+# hook never fails the git command: problems are printed as warnings.
+#
+# Install once per repository (all its worktrees share the hook):
+#   hooks=$(git rev-parse --git-path hooks)
+#   mkdir -p "$hooks" && cp post-checkout "$hooks/" && chmod +x "$hooks/post-checkout"
+#
+# To set up a worktree that already exists, run the hook from inside it
+# with no arguments.
+#
+# Windows (Git for Windows): links are native symlinks, which need Developer
+# Mode. Without it, linked paths are copied instead, with a warning. Junctions
+# are never used, because git follows them when removing a worktree and
+# deletes what they point to.
+
+set -uo pipefail
+
+# Git passes: previous HEAD, new HEAD, checkout type. `git worktree add`
+# reports the previous HEAD as all zeros; anything else is a normal checkout.
+manual=0
+if [ $# -eq 0 ]; then
+  manual=1
+else
+  case $1 in *[!0]*) exit 0 ;; esac
+fi
+
+# Don't let variables aimed at the new worktree leak into git commands that
+# read the main checkout (a stray GIT_INDEX_FILE would use the wrong index).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
+
+warn() { printf 'setup-worktree: %s\n' "$*" >&2; }
+
+DST=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+listing=$(git worktree list --porcelain) || exit 0
+SRC=$(printf '%s\n' "$listing" | sed -n '1s/^worktree //p')    # main worktree is listed first
+[ "$(printf '%s\n' "$listing" | sed -n 2p)" = bare ] && exit 0  # no main checkout to copy from
+
+SRC=$(cd -- "$SRC" && pwd -P) || exit 0
+DST=$(cd -- "$DST" && pwd -P) || exit 0
+if [ "$SRC" = "$DST" ]; then
+  [ "$manual" = 1 ] && echo "This is the main worktree; run this from inside a linked worktree."
+  exit 0
+fi
+[ -f "$SRC/.worktreelink" ] || [ -f "$SRC/.worktreeinclude" ] || exit 0
+
+case $(uname -s) in
+  MINGW* | MSYS* | CYGWIN*) on_windows=1 ;;
+  *) on_windows=0 ;;
+esac
+
+# Print (NUL-separated) the top-most untracked paths in $SRC that match the
+# patterns in file $1. Directories are printed with a trailing "/".
+matches() {
+  local patterns=$1 entry
+  local -a excludes=()
+
+  # Pass 1: git collapses fully matching directories (node_modules/, .venv/)
+  # into a single entry instead of listing every file inside them.
+  while IFS= read -r -d '' entry; do
+    printf '%s\0' "$entry"
+    excludes+=(":(exclude,literal)${entry%/}")
+  done < <(git -C "$SRC" ls-files -z --others --ignored --directory \
+             --no-empty-directory --exclude-from="$patterns")
+
+  # Pass 2: pass 1 skips matches that sit inside untracked directories which
+  # don't match as a whole, so list whatever it missed file by file.
+  git -C "$SRC" ls-files -z --others --ignored --exclude-from="$patterns" \
+    -- . ${excludes[@]+"${excludes[@]}"}
+}
+
+# shellcheck disable=SC2329  # called through process()
+copy_entry() {  # $1 = relative path
+  # -R copies directories recursively and keeps symlinks as symlinks;
+  # -p preserves modes and timestamps.
+  verb=copied
+  mkdir -p -- "$(dirname -- "$DST/$1")" && cp -Rp -- "$SRC/$1" "$DST/$1"
+}
+
+# shellcheck disable=SC2329  # called through process()
+link_entry() {  # $1 = relative path
+  verb=linked
+  mkdir -p -- "$(dirname -- "$DST/$1")" || return
+  if [ "$on_windows" = 0 ]; then
+    ln -s -- "$SRC/$1" "$DST/$1"
+  elif MSYS=winsymlinks:nativestrict CYGWIN=winsymlinks:nativestrict \
+         ln -s -- "$SRC/$1" "$DST/$1" 2>/dev/null; then
+    :  # native Windows symlink
+  else
+    warn "no permission to create symlinks, copying '$1' instead (enable Developer Mode for links)"
+    copy_entry "$1"
+  fi
+}
+
+done_count=0 skipped=0 failed=0 verb=
+
+process() {  # $1 = pattern file name, $2 = action function
+  local file="$SRC/$1" action=$2 entry rel
+  [ -f "$file" ] || return 0
+  echo "$1:"
+  while IFS= read -r -d '' entry; do
+    rel=${entry%/}
+    if [ -e "$DST/$rel" ] || [ -L "$DST/$rel" ]; then
+      printf '  exists  %s (skipped)\n' "$rel"
+      skipped=$((skipped + 1))
+    elif "$action" "$rel"; then
+      printf '  %s  %s\n' "$verb" "$rel"
+      done_count=$((done_count + 1))
+    else
+      printf '  FAILED  %s\n' "$rel" >&2
+      failed=$((failed + 1))
+    fi
+  done < <(matches "$file")
+}
+
+echo "Setting up worktree $DST"
+echo "               from $SRC"
+process .worktreelink    link_entry
+process .worktreeinclude copy_entry
+echo "Done: $done_count created, $skipped skipped, $failed failed."
+
+[ "$failed" -eq 0 ] || warn "some paths could not be set up; see above."
+exit 0
